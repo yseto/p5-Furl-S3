@@ -15,6 +15,7 @@ use Furl::S3;
     my $s3 = Furl::S3->new(
         aws_access_key_id => 'x',
         aws_secret_access_key => 'x',
+        region => 'x',
     );
     {
         for my $method(qw(create_bucket delete_bucket create_object delete_bucket)) {

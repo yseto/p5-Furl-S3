@@ -12,6 +12,7 @@ my $s3 = Furl::S3->new(
     aws_access_key_id => $ENV{TEST_AWS_ACCESS_KEY_ID},
     aws_secret_access_key => $ENV{TEST_AWS_SECRET_ACCESS_KEY},
     secure => 0,
+    region => $ENV{TEST_AWS_REGION} || 'us-west-2',
 );
 my $bucket = $ENV{TEST_S3_BUCKET} || lc('test-'. $ENV{TEST_AWS_ACCESS_KEY_ID}. '-'. time);
 

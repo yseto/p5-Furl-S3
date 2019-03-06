@@ -9,14 +9,14 @@ all_from 'lib/Furl/S3.pm';
 
 requires 'Furl' => '0.38';
 requires 'Class::Accessor::Lite';
-requires 'Digest::HMAC_SHA1';
-requires 'MIME::Base64';
 requires 'HTTP::Date';
 requires 'XML::LibXML';
 requires 'XML::LibXML::XPathContext';
 requires 'Params::Validate';
 requires 'File::Type';
 requires 'URI::Escape';
+requires 'AWS::Signature4';
+requires 'HTTP::Request';
 
 tests 't/*.t';
 author_tests 'xt';

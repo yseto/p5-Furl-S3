@@ -4,8 +4,6 @@ use strict;
 use warnings;
 use Class::Accessor::Lite;
 use Furl::HTTP qw(HEADERS_AS_HASHREF);
-use Digest::HMAC_SHA1;
-use MIME::Base64 qw(encode_base64);
 use HTTP::Date;
 use Data::Dumper;
 use XML::LibXML;
@@ -14,11 +12,17 @@ use Furl::S3::Error;
 use Params::Validate qw(:types validate_with validate_pos);
 use URI::Escape qw(uri_escape_utf8);
 use Carp ();
+use AWS::Signature4;
+use HTTP::Request;
+use URI;
+use URI::QueryParam;
+use Digest::SHA qw(sha256_hex);
+use Scalar::Util;
 
-Class::Accessor::Lite->mk_accessors(qw(aws_access_key_id aws_secret_access_key secure furl endpoint));
+Class::Accessor::Lite->mk_accessors(qw(secure furl endpoint region signer));
 
 our $VERSION = '0.02';
-our $DEFAULT_ENDPOINT = 's3.amazonaws.com';
+our $DEFAULT_ENDPOINT = 's3.%s.amazonaws.com';
 our $XMLNS = 'http://s3.amazonaws.com/doc/2006-03-01/';
 
 sub new {
@@ -28,25 +32,33 @@ sub new {
         spec => {
             aws_access_key_id => 1,
             aws_secret_access_key => 1,
+            region => 1,
         },
         allow_extra => 1,
     );
     my %args = @_;
     my $aws_access_key_id = delete $args{aws_access_key_id};
     my $aws_secret_access_key = delete $args{aws_secret_access_key};
-    Carp::croak("aws_access_key_id and aws_secret_access_key are mandatory") unless $aws_access_key_id && $aws_secret_access_key;
+    my $region = delete $args{region};
+    Carp::croak("aws_access_key_id and aws_secret_access_key and region are mandatory") unless $aws_access_key_id && $aws_secret_access_key && $region;
     my $secure = delete $args{secure} || '0';
-    my $endpoint = delete $args{endpoint} || $DEFAULT_ENDPOINT;
+    my $endpoint = delete $args{endpoint} || sprintf($DEFAULT_ENDPOINT, $region);
     my $furl = Furl::HTTP->new( 
         agent => '$class/'. $VERSION,
         %args,
         header_format => HEADERS_AS_HASHREF,
     );
+
+    my $signer = AWS::Signature4->new(
+        -access_key => $aws_access_key_id,
+        -secret_key => $aws_secret_access_key,
+    );
+
     my $self = bless {
         endpoint => $endpoint,
         secure => $secure,
-        aws_access_key_id => $aws_access_key_id,
-        aws_secret_access_key => $aws_secret_access_key,
+        signer => $signer,
+        region => $region,
         furl => $furl,
     }, $class;
     $self;
@@ -93,46 +105,6 @@ sub is_dns_style {
         return if $p =~ /-$/
     }
     return 1;
-}
-
-sub string_to_sign {
-    my( $self, $method, $resource, $headers ) = @_;
-    $headers ||= {};
-    my %headers_to_sign;
-    while (my($k, $v) = each %{$headers}) {
-        my $key = lc $k;
-        if ( $key =~ /^(content-md5|content-type|date|expires)$/ or 
-                 $key =~ /^x-amz-/ ) {
-            $headers_to_sign{$key} = _trim($v);
-        }
-    }
-    my $str = "$method\n";
-    $str .= $headers_to_sign{'content-md5'} || '';
-    $str .= "\n";
-    $str .= $headers_to_sign{'content-type'} || '';
-    $str .= "\n";
-    $str .= $headers_to_sign{'expires'} || $headers_to_sign{'date'} || '';
-    $str .= "\n";
-    for my $key( sort grep { /^x-amz-/ } keys %headers_to_sign ) {
-        $str .= "$key:$headers_to_sign{$key}\n";
-    }
-    my( $path, $query ) = split /\?/, $resource;
-    # sub-resource.
-    if ( $query && $query =~ m{^(acl|policy|location|versions)$} ) {
-        $str .= $resource;
-    }
-    else {
-        $str .= $path;
-    }
-
-    $str;
-}
-
-sub sign {
-    my( $self, $str ) = @_;
-    my $hmac = Digest::HMAC_SHA1->new( $self->aws_secret_access_key );
-    $hmac->add( $str );
-    encode_base64( $hmac->digest, '' );
 }
 
 sub resource {
@@ -197,23 +169,44 @@ sub request {
     if ( !$h{'expires'} && !$h{'date'} ) {
         $h{'date'} = time2str(time);
     }
-    my $resource = $self->resource( $bucket, $key );
-    my $string_to_sign = 
-        $self->string_to_sign( $method, $resource, \%h );
-    my $signed_string = $self->sign( $string_to_sign );
-    my $auth_header = 'AWS '. $self->aws_access_key_id. ':'. $signed_string;
-    $h{'authorization'} = $auth_header;
 
     my( $host, $path_query ) = 
         $self->host_and_path_query( $bucket, $key, $params );
     my %res;
     my @h = %h;
+
+    my $u = URI->new(sprintf('%s://%s', ($self->secure ? 'https' : 'http'), $host));
+    $u->path_query($path_query);
+
+    my $content_is_fh = Scalar::Util::openhandle($furl_options->{content});
+
+    my $req = HTTP::Request->new(
+        $method,
+        $u->as_string,
+        \@h,
+        $content_is_fh ? undef : $furl_options->{content},
+    );
+
+    # filehandle uses "UNSIGNED-PRELOAD"
+    my $payload_digest = $content_is_fh ? 'UNSIGNED-PAYLOAD' : sha256_hex($req->content);
+    $req->header('X-Amz-Content-Sha256' => $payload_digest);
+    $self->signer->sign($req, $self->region, $payload_digest);
+
+    # stolen from Furl
+    my $req_headers = $req->headers;
+    $req_headers->remove_header('Host'); # suppress duplicate Host header
+    my $signed_headers = +[
+        map {
+            my $k = $_;
+            map { ( $k => $_ ) } $req_headers->header($_);
+        } $req_headers->header_field_names
+    ];
+
     @res{qw(ver code msg headers body)} = $self->furl->request(
-        method => $method,
-        scheme => ($self->secure ? 'https' : 'http'),
-        host => $host,
-        path_query => $path_query,
-        headers => \@h,
+        url     => $req->uri,
+        method  => $req->method,
+        content => $content_is_fh ? $furl_options->{content} : $req->content,
+        headers => $signed_headers,
         %{$furl_options},
     );
     return \%res;
@@ -223,17 +216,12 @@ sub signed_url {
     my $self = shift;
     validate_pos(@_, 1, 1, +{ regexp => qr/^\d+$/, });
     my( $bucket, $key, $expires ) = @_;
-    my $resource = $self->resource( $bucket, $key );
-    my $string_to_sign = $self->string_to_sign('GET', $resource, +{
-        expires => $expires,
-    });
-    my $sig = $self->sign( $string_to_sign );
-    my($host, $path_query) = $self->host_and_path_query( $bucket, $key, +{
-        AWSAccessKeyId => $self->aws_access_key_id,
-        Expires => $expires,
-        Signature => $sig,
-    } );
-    sprintf '%s://%s%s', ($self->secure ? 'https' : 'http'), $host, $path_query;
+    my $expires_in = $expires - time;
+
+    # imitate "aws s3 presign"
+    my $u = URI->new(sprintf('%s://%s', ($self->secure ? 'https' : 'http'), $self->endpoint));
+    $u->path_query($self->_path_query( join('/', $bucket, $key), +{}));
+    $self->signer->signed_url($u, $expires_in);
 }
 
 
@@ -279,7 +267,16 @@ sub create_bucket {
                     callbacks => { bucket_name => \&validate_bucket } },
                   { type => HASHREF, optional => 1, } );
 
-    my $res = $self->request( 'PUT', $bucket, undef, undef, $headers );
+    my $data;
+    # ref: https://docs.aws.amazon.com/general/latest/gr/rande.html
+    # ...If you use a region other than the US East (N. Virginia) endpoint to create a bucket, you must set the LocationConstraint bucket parameter to the same region....
+    if ($self->region ne 'us-east-1') {
+        $data = "<CreateBucketConfiguration><LocationConstraint>".
+                $self->region.
+                "</LocationConstraint></CreateBucketConfiguration>";
+    }
+
+    my $res = $self->request( 'PUT', $bucket, undef, undef, $headers, +{ content => $data });
     unless ( _http_is_success($res->{code}) ) {
         return $self->error( $res );
     }
