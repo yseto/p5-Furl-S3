@@ -21,7 +21,7 @@ use Scalar::Util;
 
 Class::Accessor::Lite->mk_accessors(qw(secure furl endpoint region signer));
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 our $DEFAULT_ENDPOINT = 's3.%s.amazonaws.com';
 our $XMLNS = 'http://s3.amazonaws.com/doc/2006-03-01/';
 

@@ -1,5 +1,8 @@
 Revision history for Perl extension Furl::S3
 
+0.03
+        - switch over signatureV4
+
 0.02
         - use Furl::HTTP
         - handle utf-8 string correctly
